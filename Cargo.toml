@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "cordis-core",
+    "cordis-timer",
+    "cordis-logger-console",
+    "cordis-utils",
+    "cordis-group",
+    "cordis-include",
+    "cordis-loader",
+    "cordis-hmr",
+    "cordis-create",
+]
+resolver = "2"

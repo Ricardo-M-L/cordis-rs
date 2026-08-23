@@ -1,0 +1,9 @@
+[package]
+name = "cordis-group"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Entry grouping for cordis-rs"
+license = "MIT"
+homepage = "https://github.com/Ricardo-M-L/cordis-rs"
+repository = "https://github.com/Ricardo-M-L/cordis-rs"
