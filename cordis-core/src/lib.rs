@@ -10,7 +10,7 @@ pub mod service;
 pub mod utils;
 
 // Re-export key types for convenience
-pub use context::CordisContext;
+pub use context::{ContextScope, CordisContext};
 pub use events::{EventArgs, EventHandle, EventValue, EventsService};
 pub use fiber::{disposer, Disposer, EffectorHandle, Fiber, FiberState};
 pub use logger::{Exporter, LoggerLevel, LoggerService, Message};

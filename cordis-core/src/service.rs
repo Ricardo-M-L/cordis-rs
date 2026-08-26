@@ -1,27 +1,45 @@
-//! Service trait — the base contract for every Cordis service.
+//! Service trait - the base contract for every Cordis service.
+//!
+//! Mirrors upstream `packages/core/src/service.ts`:
+//!
+//! - `name` is the unique service identifier under which the service is provided.
+//! - `init` is the optional one-time initialization hook (upstream `symbols.init`),
+//!   invoked by the framework when the owning fiber's runtime starts.
+//! - `check` is the optional readiness probe (upstream `symbols.check`) that gates
+//!   access to the service's value.
+//! - `invoke` is the OPTIONAL callable-service protocol (upstream `symbols.invoke`):
+//!   a service that implements it can be called like a function. Unlike the
+//!   previous Rust port, it is not a required method returning a generic error -
+//!   only services that opt in provide it.
+//!
+//! There is no `start()`/`stop()` contract upstream; lifecycle is expressed by
+//! registering cleanup with the owning fiber's `effect()`.
 
 use std::any::Any;
 
 /// Every Cordis service implements `Service`.
-///
-/// - `name()` — unique service identifier.
-/// - `init()` — one-time initialisation (called by the framework).
-/// - `check()` — health / liveness check (called periodically or on demand).
-/// - `invoke()` — optional runtime call; unsupported services return a typed error string.
 pub trait Service: Send + Sync {
     /// The service's unique name.
     fn name(&self) -> &str;
 
-    /// Initialisation hook. Called once during framework bootstrap.
-    fn init(&self) -> Result<(), String>;
+    /// Initialization hook. Called once during framework bootstrap, mirroring
+    /// upstream `symbols.init` invoked when the fiber runtime starts.
+    fn init(&self) -> Result<(), String> {
+        Ok(())
+    }
 
-    /// Health / consistency check.
-    fn check(&self) -> Result<(), String>;
+    /// Health / consistency check, mirroring upstream `symbols.check`.
+    fn check(&self) -> Result<(), String> {
+        Ok(())
+    }
 
-    /// Invoke the service with a variadic argument list.
-    /// Override this method in concrete services to provide custom behaviour.
-    /// Default returns an error indicating the service does not support invocation.
-    fn invoke(&self, _args: &[Box<dyn Any>]) -> Result<Box<dyn Any>, String> {
-        Err(format!("service {} does not support invoke", self.name()))
+    /// Optional callable-service protocol, mirroring upstream `symbols.invoke`.
+    /// Services that implement it can be invoked like functions; the default
+    /// implementation marks the service as not callable.
+    fn invoke(
+        &self,
+        _args: &[Box<dyn Any + Send + Sync>],
+    ) -> Option<Result<Box<dyn Any + Send + Sync>, String>> {
+        None // not a callable service
     }
 }

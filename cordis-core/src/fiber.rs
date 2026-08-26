@@ -361,6 +361,17 @@ impl EffectorHandle {
         self.effect_id.is_some()
     }
 
+    /// Leave the cleanup registered with the owning fiber without leaking this handle.
+    ///
+    /// Dropping an ordinary [`EffectorHandle`] disposes its effect immediately.  Runtime
+    /// facilities such as context-bound services and event listeners instead need the
+    /// fiber to retain the cleanup until the whole scope is disposed.  `detach()` transfers
+    /// that responsibility to the fiber while still allowing the handle's `Weak` reference
+    /// to be released normally.
+    pub fn detach(mut self) {
+        self.effect_id = None;
+    }
+
     fn dispose_inner(&mut self) {
         let Some(effect_id) = self.effect_id.take() else {
             return;
