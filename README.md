@@ -11,13 +11,13 @@ An experimental Rust adaptation of [Cordis](https://github.com/cordisjs/cordis),
 ## Implemented behavior
 
 - **Fiber**: validated states, typed effect results, synchronous/asynchronous factories, RAII handles, and LIFO cleanup.
-- **Context**: typed hierarchical scopes with inherited reads, local writes, deletion masks, and explicit isolation identities.
-- **Events**: synchronous and asynchronous listeners, listener removal, serial/bail/waterfall dispatch, and concurrent parallel dispatch.
-- **Registry**: plugin validation, named dependency checks, duplicate protection, and rollback-safe unload.
+- **Context**: typed hierarchical scopes, per-service isolation, layered configuration intercepts, and explicit runtime binding.
+- **Events**: scoped synchronous/asynchronous listeners, context filtering, Fiber-owned cleanup, serial/bail/waterfall dispatch, and concurrent parallel dispatch.
+- **Registry**: isolated plugin/service slots, Service init/check integration, named dependency checks, duplicate protection, and staged replacement.
 - **Logger**: `%s`, `%d`, `%o` formatting, Unicode-safe truncation, bounded message history, and reentrant exporters.
 - **Timer**: stoppable timeout/interval streams and reusable debounce/throttle handles.
 - **Include**: JSON, YAML, and TOML file loading plus safe object/array patches.
-- **Loader**: entry-tree activation through statically registered Rust module factories, scoped contexts, disabled-tree propagation, unload, reload, and rollback.
+- **Loader**: entry-tree activation through statically registered Rust module factories, resolved Context intercepts, scoped contexts, disabled-tree propagation, unload, staged reload, and side-effect rollback.
 - **HMR**: recursive operating-system file watching, debounce, ignored paths, callbacks, and transitive dependency reload events. The application remains responsible for mapping reload events to its module factories.
 - **Create**: executable project generator with overwrite protection, built-in or Git templates, optional Git initialization, and release-profile generation.
 
@@ -71,6 +71,12 @@ cargo run -p cordis-create -- my-cordis-app --target /tmp/my-cordis-app --git
 ```
 
 Existing non-empty directories are preserved unless `--force` is explicitly supplied.
+
+## Runtime integration boundary
+
+`Loader::with_runtime()` binds a root `CordisContext` to one `RegistryService` and shared event bus. Each plugin is prepared in a Loading `Fiber`; services and listeners registered during `Plugin::apply()` remain hidden until activation and are removed with that Fiber. Per-name isolation labels key both plugins and services, while Context intercepts are resolved into the configuration passed to module factories. Reload stages a new Fiber and cleans all of its effects on failure before retaining the old runtime.
+
+This explicit lifecycle replaces Cordis' JavaScript Proxy-based service lookup. It does not implement dynamic JavaScript module linking or offer drop-in API compatibility.
 
 ## HMR boundary
 
