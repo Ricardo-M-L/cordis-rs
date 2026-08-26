@@ -40,6 +40,7 @@ impl Loader {
         registry: Arc<RegistryService>,
         modules: Arc<ModuleLoader>,
     ) -> Self {
+        root.bind_registry(&registry);
         Self {
             config,
             entries: Arc::new(Mutex::new(Vec::new())),
@@ -111,17 +112,17 @@ impl Loader {
         let entry = Arc::new(Entry::new(config));
         loaded.push(Arc::clone(&entry));
 
-        let context = if entry.config().isolates.is_empty() {
-            parent.extend()
-        } else {
-            parent.isolate()
-        };
-        context.set_typed("loader.config", entry.config().config.clone());
+        let mut context = parent.extend();
+        for name in &entry.config().isolates {
+            context = context.isolate_name(name, None);
+        }
         context.set_typed("loader.groups", entry.config().groups.clone());
         context.set_typed("loader.isolates", entry.config().isolates.clone());
 
         if enabled {
-            let plugin = match runtime.modules.instantiate(entry.config()) {
+            let resolved_config = resolve_entry_config(entry.config(), &context);
+            context.set_typed("loader.config", resolved_config.config.clone());
+            let plugin = match runtime.modules.instantiate(&resolved_config) {
                 Ok(plugin) => plugin,
                 Err(error) => {
                     entry.fail(error.clone());
@@ -201,23 +202,30 @@ impl Loader {
         let context = entry
             .context()
             .ok_or_else(|| format!("entry is not active: {name}"))?;
-        let plugin = runtime.modules.instantiate(entry.config())?;
-        runtime.registry.unregister(name, &context)?;
-        if let Err(error) = runtime.registry.register(plugin, &context) {
-            let rollback_result = runtime
-                .modules
-                .instantiate(entry.config())
-                .and_then(|plugin| runtime.registry.register(plugin, &context));
-            if rollback_result.is_ok() {
-                entry.activate(context);
-            } else {
-                entry.fail(format!("reload failed: {error}; rollback failed"));
-            }
-            return Err(error);
+
+        let resolved_config = resolve_entry_config(entry.config(), &context);
+        context.set_typed("loader.config", resolved_config.config.clone());
+        let new_plugin = runtime.modules.instantiate(&resolved_config)?;
+        if new_plugin.name() != entry.name() {
+            return Err(format!(
+                "module {} created plugin with mismatched name {}",
+                entry.name(),
+                new_plugin.name()
+            ));
         }
+        runtime.registry.replace(new_plugin, &context)?;
         entry.activate(context);
         Ok(())
     }
+}
+
+/// Apply the Context intercept chain to the entry's base configuration before the
+/// module factory or plugin sees it. This is the explicit Rust counterpart of
+/// Cordis' `Service.resolveConfig()` proxy path.
+fn resolve_entry_config(config: &EntryConfig, context: &CordisContext) -> EntryConfig {
+    let mut resolved = config.clone();
+    resolved.config = context.resolve_config(config.name(), Some(&config.config), None);
+    resolved
 }
 
 fn collect_tree(config: EntryConfig, parent_enabled: bool, output: &mut Vec<Arc<Entry>>) {
@@ -293,6 +301,96 @@ mod tests {
     }
 
     #[test]
+    fn runtime_chain_resolves_intercepts_isolation_events_and_fiber_cleanup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct IntegratedPlugin {
+            value: u64,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Plugin for IntegratedPlugin {
+            fn apply(&self, ctx: &CordisContext) -> Result<(), String> {
+                let config = ctx
+                    .get_typed::<serde_json::Value>("loader.config")
+                    .ok_or_else(|| "resolved loader config is missing".to_string())?;
+                if config.get("value").and_then(serde_json::Value::as_u64) != Some(self.value) {
+                    return Err("factory and plugin contexts saw different configs".to_string());
+                }
+                ctx.provide_service("worker", Arc::new(self.value))?;
+                let calls = Arc::clone(&self.calls);
+                ctx.on("worker/tick", move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    None
+                })?;
+                Ok(())
+            }
+
+            fn name(&self) -> &str {
+                "worker"
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&calls);
+        let modules = Arc::new(ModuleLoader::new());
+        modules
+            .register("worker", move |config| {
+                let value = config
+                    .config
+                    .get("value")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "resolved value is missing".to_string())?;
+                if config.config.get("baseOnly") != Some(&serde_json::json!(true))
+                    || config.config.get("intercepted") != Some(&serde_json::json!(true))
+                {
+                    return Err("entry base and Context intercept were not merged".to_string());
+                }
+                Ok(Box::new(IntegratedPlugin {
+                    value,
+                    calls: Arc::clone(&factory_calls),
+                }))
+            })
+            .expect("register integrated module");
+
+        let registry = Arc::new(RegistryService::new(Arc::new(LoggerService::new(
+            "integration",
+        ))));
+        let root = CordisContext::new().intercept(
+            "worker",
+            serde_json::json!({ "value": 7, "intercepted": true }),
+        );
+        let loader = Loader::with_runtime(
+            LoaderConfig::default(),
+            root.clone(),
+            Arc::clone(&registry),
+            modules,
+        );
+        let mut config = EntryConfig::new("worker");
+        config.config = serde_json::json!({ "value": 1, "baseOnly": true });
+        config.isolates.push("worker".to_string());
+        let loaded = loader.try_load(config).expect("load integrated runtime");
+        let context = loaded[0].context().expect("active entry context");
+
+        assert!(root.get_service::<u64>("worker").is_none());
+        assert_eq!(context.get_service::<u64>("worker").as_deref(), Some(&7));
+        assert!(registry.has_plugin_in("worker", &context));
+        let selected = context.clone();
+        let dispatch =
+            context.with_event_filter(move |listener| listener.shares_isolate(&selected, "worker"));
+        dispatch
+            .emit("worker/tick", vec![])
+            .expect("dispatch scoped plugin event");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.events().listener_count("worker/tick"), 1);
+
+        assert!(loader.unload("worker").expect("unload integrated runtime"));
+        assert!(context.get_service::<u64>("worker").is_none());
+        assert!(!registry.has_plugin_in("worker", &context));
+        assert_eq!(registry.events().listener_count("worker/tick"), 0);
+    }
+
+    #[test]
     fn disabled_parent_disables_children() {
         let mut root = EntryConfig::new("root");
         root.disabled = true;
@@ -327,5 +425,147 @@ mod tests {
         assert!(loader.try_load(root).is_err());
         assert!(registry.plugin_names().is_empty());
         assert!(loader.entries().is_empty());
+    }
+
+    #[test]
+    fn failed_reload_restores_original_instance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Plugin that counts instantiations and can fail on demand.
+        struct ReloadablePlugin {
+            name: String,
+            fail_next: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Plugin for ReloadablePlugin {
+            fn apply(&self, _ctx: &CordisContext) -> Result<(), String> {
+                if self.fail_next.swap(false, Ordering::SeqCst) {
+                    return Err("reload apply failed".to_string());
+                }
+                Ok(())
+            }
+
+            fn name(&self) -> &str {
+                &self.name
+            }
+        }
+
+        let fail_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let instances = Arc::new(AtomicUsize::new(0));
+        let modules = Arc::new(ModuleLoader::new());
+        let fail_for_factory = Arc::clone(&fail_next);
+        let instances_for_factory = Arc::clone(&instances);
+        modules
+            .register("app", move |_config| {
+                instances_for_factory.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(ReloadablePlugin {
+                    name: "app".to_string(),
+                    fail_next: Arc::clone(&fail_for_factory),
+                }) as Box<dyn Plugin>)
+            })
+            .expect("register module");
+
+        let registry = Arc::new(RegistryService::new(Arc::new(LoggerService::new("test"))));
+        let loader = Loader::with_runtime(
+            LoaderConfig::default(),
+            CordisContext::new(),
+            Arc::clone(&registry),
+            modules,
+        );
+        loader
+            .try_load(EntryConfig::new("app"))
+            .expect("initial load");
+        assert_eq!(instances.load(Ordering::SeqCst), 1);
+
+        // Make the NEXT instantiation fail at apply time.
+        fail_next.store(true, Ordering::SeqCst);
+        assert!(loader.reload("app").is_err());
+        // The factory ran (for the failed attempt) but the registry must still
+        // hold the ORIGINAL instance: reload failure must not lose state.
+        assert_eq!(instances.load(Ordering::SeqCst), 2);
+        assert!(registry.has_plugin("app"));
+
+        // A subsequent successful reload works.
+        assert!(loader.reload("app").is_ok());
+        assert_eq!(instances.load(Ordering::SeqCst), 3);
+        assert!(registry.has_plugin("app"));
+    }
+
+    #[test]
+    fn reload_transaction_cleans_staged_effects_and_switches_services() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct RuntimePlugin {
+            generation: usize,
+            fail_after_apply: bool,
+            fail_unload: Arc<AtomicBool>,
+        }
+
+        impl Plugin for RuntimePlugin {
+            fn apply(&self, ctx: &CordisContext) -> Result<(), String> {
+                ctx.provide_service("app", Arc::new(self.generation))?;
+                ctx.on("app/tick", |_| None)?;
+                if self.fail_after_apply {
+                    return Err("failed after registering effects".to_string());
+                }
+                Ok(())
+            }
+
+            fn name(&self) -> &str {
+                "app"
+            }
+
+            fn unload(&self, _ctx: &CordisContext) -> Result<(), String> {
+                if self.fail_unload.swap(false, Ordering::SeqCst) {
+                    return Err("old runtime refused to unload".to_string());
+                }
+                Ok(())
+            }
+        }
+
+        let generation = Arc::new(AtomicUsize::new(0));
+        let fail_next = Arc::new(AtomicBool::new(false));
+        let fail_unload = Arc::new(AtomicBool::new(false));
+        let modules = Arc::new(ModuleLoader::new());
+        let factory_generation = Arc::clone(&generation);
+        let factory_failure = Arc::clone(&fail_next);
+        let factory_unload_failure = Arc::clone(&fail_unload);
+        modules
+            .register("app", move |_config| {
+                Ok(Box::new(RuntimePlugin {
+                    generation: factory_generation.fetch_add(1, Ordering::SeqCst) + 1,
+                    fail_after_apply: factory_failure.swap(false, Ordering::SeqCst),
+                    fail_unload: Arc::clone(&factory_unload_failure),
+                }))
+            })
+            .expect("register runtime factory");
+
+        let registry = Arc::new(RegistryService::new(Arc::new(LoggerService::new("test"))));
+        let root = CordisContext::new();
+        let loader = Loader::with_runtime(
+            LoaderConfig::default(),
+            root.clone(),
+            Arc::clone(&registry),
+            modules,
+        );
+        loader
+            .try_load(EntryConfig::new("app"))
+            .expect("initial load");
+        assert_eq!(root.get_service::<usize>("app").as_deref(), Some(&1));
+        assert_eq!(registry.events().listener_count("app/tick"), 1);
+
+        fail_unload.store(true, Ordering::SeqCst);
+        assert!(loader.reload("app").is_err());
+        assert_eq!(root.get_service::<usize>("app").as_deref(), Some(&1));
+        assert_eq!(registry.events().listener_count("app/tick"), 1);
+
+        fail_next.store(true, Ordering::SeqCst);
+        assert!(loader.reload("app").is_err());
+        assert_eq!(root.get_service::<usize>("app").as_deref(), Some(&1));
+        assert_eq!(registry.events().listener_count("app/tick"), 1);
+
+        loader.reload("app").expect("successful replacement");
+        assert_eq!(root.get_service::<usize>("app").as_deref(), Some(&4));
+        assert_eq!(registry.events().listener_count("app/tick"), 1);
     }
 }
