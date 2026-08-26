@@ -2,13 +2,14 @@
 name = "cordis-timer"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
+publish = false
 description = "Async timer service for cordis-rs — timeout, interval, throttle, debounce"
 license = "MIT"
 homepage = "https://github.com/Ricardo-M-L/cordis-rs"
 repository = "https://github.com/Ricardo-M-L/cordis-rs"
 
 [dependencies]
-cordis-core = { path = "../cordis-core" }
+cordis-core = { version = "0.1.0", path = "../cordis-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 futures = "0.3"

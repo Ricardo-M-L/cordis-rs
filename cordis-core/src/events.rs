@@ -1,110 +1,212 @@
-//! Events service — pub/sub with serial, parallel, waterfall, and bail execution strategies.
+//! Typed event bus with synchronous and asynchronous dispatch strategies.
 
+use crate::logger::LoggerService;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, RwLock};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock, Weak};
 
-use crate::logger::LoggerService;
+pub type EventValue = Arc<dyn Any + Send + Sync>;
+pub type EventArgs = Vec<EventValue>;
+type EventFuture = Pin<Box<dyn Future<Output = Option<EventValue>> + Send + 'static>>;
+type SyncHandler = Arc<dyn Fn(EventArgs) -> Option<EventValue> + Send + Sync>;
+type AsyncHandler = Arc<dyn Fn(EventArgs) -> EventFuture + Send + Sync>;
 
-/// Type alias for boxed event handlers (Arc so they're Clone-able across the async boundary).
-type Handler =
-    Arc<dyn Fn(Vec<Arc<dyn Any + Send + Sync>>) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>;
+#[derive(Clone)]
+enum Handler {
+    Sync(SyncHandler),
+    Async(AsyncHandler),
+}
 
-/// EventsService is a pub/sub event bus that supports four invocation strategies:
-///   - **emit**: fire-and-forget, handlers run inline
-///   - **serial**: run handlers in order, return the first non-None result
-///   - **parallel**: run all handlers concurrently, wait for all to finish
-///   - **waterfall**: run handlers in order, passing each result as the first arg to the next
-///   - **bail**: like serial but stops at the first handler that returns Some
+#[derive(Clone)]
+struct HandlerEntry {
+    id: usize,
+    handler: Handler,
+}
+
+type HandlerMap = HashMap<String, Vec<HandlerEntry>>;
+
+/// Explicit listener removal handle. Dropping it does not unregister the listener,
+/// preserving the traditional event-emitter behavior when callers ignore `on()`'s return value.
+#[derive(Clone)]
+pub struct EventHandle {
+    handlers: Weak<RwLock<HandlerMap>>,
+    event: String,
+    id: usize,
+}
+
+impl EventHandle {
+    pub fn dispose(&self) -> bool {
+        let Some(handlers) = self.handlers.upgrade() else {
+            return false;
+        };
+        let mut handlers = write(&handlers);
+        let Some(entries) = handlers.get_mut(&self.event) else {
+            return false;
+        };
+        let old_len = entries.len();
+        entries.retain(|entry| entry.id != self.id);
+        let removed = entries.len() != old_len;
+        if entries.is_empty() {
+            handlers.remove(&self.event);
+        }
+        removed
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
+impl std::fmt::Debug for EventHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EventHandle")
+            .field("event", &self.event)
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
 pub struct EventsService {
-    handlers: Arc<RwLock<HashMap<String, Vec<Handler>>>>,
+    handlers: Arc<RwLock<HandlerMap>>,
+    next_handler: AtomicUsize,
     logger: Arc<LoggerService>,
 }
 
 impl EventsService {
-    /// Create a new EventsService backed by the given logger.
     pub fn new(logger: Arc<LoggerService>) -> Self {
-        EventsService {
+        Self {
             handlers: Arc::new(RwLock::new(HashMap::new())),
+            next_handler: AtomicUsize::new(1),
             logger,
         }
     }
 
-    /// Register a handler for the given event name.
     pub fn on(
         &self,
         name: &str,
-        handler: impl Fn(Vec<Arc<dyn Any + Send + Sync>>) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync + 'static,
-    ) {
-        let mut map = self.handlers.write().unwrap();
-        let event_name = name.to_string();
-        let _ = &self.logger;
-        map.entry(event_name)
-            .or_insert_with(Vec::new)
-            .push(Arc::new(handler));
+        handler: impl Fn(EventArgs) -> Option<EventValue> + Send + Sync + 'static,
+    ) -> EventHandle {
+        self.register(name, Handler::Sync(Arc::new(handler)))
     }
 
-    /// Fire-and-forget: run all handlers for `name` synchronously and inline.
-    pub fn emit(&self, name: &str, args: Vec<Arc<dyn Any + Send + Sync>>) {
-        let map = self.handlers.read().unwrap();
-        if let Some(handlers) = map.get(name) {
-            for handler in handlers {
-                let _ = handler(args.clone());
+    pub fn on_async<F, Fut>(&self, name: &str, handler: F) -> EventHandle
+    where
+        F: Fn(EventArgs) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<EventValue>> + Send + 'static,
+    {
+        self.register(
+            name,
+            Handler::Async(Arc::new(move |args| Box::pin(handler(args)))),
+        )
+    }
+
+    fn register(&self, name: &str, handler: Handler) -> EventHandle {
+        let id = self.next_handler.fetch_add(1, Ordering::SeqCst);
+        write(&self.handlers)
+            .entry(name.to_string())
+            .or_default()
+            .push(HandlerEntry { id, handler });
+        EventHandle {
+            handlers: Arc::downgrade(&self.handlers),
+            event: name.to_string(),
+            id,
+        }
+    }
+
+    pub fn off(&self, handle: &EventHandle) -> bool {
+        handle.dispose()
+    }
+
+    pub fn listener_count(&self, name: &str) -> usize {
+        read(&self.handlers).get(name).map_or(0, Vec::len)
+    }
+
+    /// Invoke synchronous handlers inline and schedule asynchronous handlers on the
+    /// active Tokio runtime. The handler list is cloned before invocation, so handlers
+    /// may safely register or remove listeners reentrantly.
+    pub fn emit(&self, name: &str, args: EventArgs) {
+        for entry in self.resolve(name) {
+            match entry.handler {
+                Handler::Sync(handler) => {
+                    let _ = handler(args.clone());
+                }
+                Handler::Async(handler) => match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => {
+                        let args = args.clone();
+                        runtime.spawn(async move {
+                            let _ = handler(args).await;
+                        });
+                    }
+                    Err(error) => self.logger.error(
+                        "cannot emit async handler without a Tokio runtime: %s",
+                        vec![Box::new(error.to_string())],
+                    ),
+                },
             }
         }
     }
 
-    /// Run all handlers for `name` in parallel, await all of them.
-    pub fn parallel(
-        &self,
-        name: &str,
-        args: Vec<Arc<dyn Any + Send + Sync>>,
-    ) -> impl Future<Output = ()> {
-        let handlers: Vec<Handler> = {
-            let map = self.handlers.read().unwrap();
-            map.get(name).cloned().unwrap_or_default()
-        };
+    /// Run all handlers concurrently and wait for every handler to settle.
+    pub async fn parallel(&self, name: &str, args: EventArgs) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for entry in self.resolve(name) {
+            match entry.handler {
+                Handler::Sync(handler) => {
+                    let args = args.clone();
+                    tasks.spawn_blocking(move || handler(args));
+                }
+                Handler::Async(handler) => {
+                    let args = args.clone();
+                    tasks.spawn(async move { handler(args).await });
+                }
+            }
+        }
 
-        async move {
-            for handler in handlers {
-                let _ = handler(args.clone());
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                self.logger.error(
+                    "parallel event handler failed: %s",
+                    vec![Box::new(error.to_string())],
+                );
             }
         }
     }
 
-    /// Run handlers serially and return the first non-None result.
-    pub fn serial(
-        &self,
-        name: &str,
-        args: Vec<Arc<dyn Any + Send + Sync>>,
-    ) -> Option<Arc<dyn Any + Send + Sync>> {
-        let handlers: Vec<Handler> = {
-            let map = self.handlers.read().unwrap();
-            map.get(name).cloned().unwrap_or_default()
-        };
-
-        for handler in handlers {
-            if let Some(result) = handler(args.clone()) {
-                return Some(result);
+    /// Synchronous ordered dispatch. Asynchronous handlers are skipped; use
+    /// [`EventsService::serial_async`] when an event can contain both kinds.
+    pub fn serial(&self, name: &str, args: EventArgs) -> Option<EventValue> {
+        for entry in self.resolve(name) {
+            if let Handler::Sync(handler) = entry.handler {
+                if let Some(result) = handler(args.clone()) {
+                    return Some(result);
+                }
             }
         }
         None
     }
 
-    /// Run handlers serially; stop at the first handler that returns Some.
-    pub fn bail(
-        &self,
-        name: &str,
-        args: Vec<Arc<dyn Any + Send + Sync>>,
-    ) -> Option<Arc<dyn Any + Send + Sync>> {
-        let handlers: Vec<Handler> = {
-            let map = self.handlers.read().unwrap();
-            map.get(name).cloned().unwrap_or_default()
-        };
-
-        for handler in handlers {
-            let result = handler(args.clone());
+    pub async fn serial_async(&self, name: &str, args: EventArgs) -> Option<EventValue> {
+        for entry in self.resolve(name) {
+            let result = match entry.handler {
+                Handler::Sync(handler) => {
+                    let args = args.clone();
+                    match tokio::task::spawn_blocking(move || handler(args)).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.logger.error(
+                                "serial event handler failed: %s",
+                                vec![Box::new(error.to_string())],
+                            );
+                            None
+                        }
+                    }
+                }
+                Handler::Async(handler) => handler(args.clone()).await,
+            };
             if result.is_some() {
                 return result;
             }
@@ -112,41 +214,56 @@ impl EventsService {
         None
     }
 
-    /// Run handlers in a waterfall: each handler's return value becomes the first
-    /// argument to the next handler. Returns the last non-None value.
-    pub fn waterfall(
-        &self,
-        name: &str,
-        args: Vec<Arc<dyn Any + Send + Sync>>,
-    ) -> Option<Arc<dyn Any + Send + Sync>> {
-        let handlers: Vec<Handler> = {
-            let map = self.handlers.read().unwrap();
-            map.get(name).cloned().unwrap_or_default()
-        };
+    pub fn bail(&self, name: &str, args: EventArgs) -> Option<EventValue> {
+        self.serial(name, args)
+    }
 
+    /// Pass each non-empty result as the first argument to the next synchronous handler.
+    /// The first argument is replaced instead of repeatedly prepended.
+    pub fn waterfall(&self, name: &str, args: EventArgs) -> Option<EventValue> {
         let mut current_args = args;
-        let mut last_result: Option<Arc<dyn Any + Send + Sync>> = None;
-
-        for handler in handlers {
-            last_result = handler(current_args.clone());
-            if let Some(ref val) = last_result {
-                let mut next_args = Vec::with_capacity(current_args.len() + 1);
-                next_args.push(Arc::clone(val));
-                for a in current_args {
-                    next_args.push(a);
+        let mut last_result = None;
+        for entry in self.resolve(name) {
+            let Handler::Sync(handler) = entry.handler else {
+                continue;
+            };
+            if let Some(result) = handler(current_args.clone()) {
+                if current_args.is_empty() {
+                    current_args.push(Arc::clone(&result));
+                } else {
+                    current_args[0] = Arc::clone(&result);
                 }
-                current_args = next_args;
+                last_result = Some(result);
             }
         }
         last_result
     }
+
+    fn resolve(&self, name: &str) -> Vec<HandlerEntry> {
+        read(&self.handlers).get(name).cloned().unwrap_or_default()
+    }
 }
 
 impl std::fmt::Debug for EventsService {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let map = self.handlers.read().unwrap();
-        f.debug_struct("EventsService")
-            .field("event_count", &map.len())
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let handlers = read(&self.handlers);
+        formatter
+            .debug_struct("EventsService")
+            .field("event_count", &handlers.len())
+            .field(
+                "listener_count",
+                &handlers.values().map(Vec::len).sum::<usize>(),
+            )
             .finish()
     }
+}
+
+fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

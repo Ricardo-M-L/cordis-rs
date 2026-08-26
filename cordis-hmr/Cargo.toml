@@ -2,7 +2,8 @@
 name = "cordis-hmr"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
+publish = false
 description = "Hot Module Replacement for cordis-rs"
 license = "MIT"
 homepage = "https://github.com/Ricardo-M-L/cordis-rs"
@@ -10,4 +11,4 @@ repository = "https://github.com/Ricardo-M-L/cordis-rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+notify = "6.1"

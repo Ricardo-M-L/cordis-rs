@@ -31,7 +31,7 @@ impl Reflect {
     /// Provide a value under `key` with its concrete type.
     pub fn provide<T: Any + Send + Sync + 'static>(&mut self, key: &str, value: T) {
         let type_id = TypeId::of::<T>();
-        let entry = self.store.entry(type_id).or_insert_with(HashMap::new);
+        let entry = self.store.entry(type_id).or_default();
         entry.insert(key.to_string(), Arc::new(value));
     }
 

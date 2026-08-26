@@ -1,8 +1,8 @@
 //! Integration tests for the cordis-core crate.
 
 use crate::*;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 // -------------------------
 // Fiber
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[test]
 fn test_fiber_basic() {
     let f = crate::fiber::Fiber::new();
-    assert_eq!(f.is_ready(), false);
+    assert!(!f.is_ready());
 }
 
 #[test]
@@ -119,17 +119,63 @@ fn test_registry_unregister_plugin() {
     let logger = Arc::new(logger::LoggerService::new("registry-unreg"));
     let registry = registry::RegistryService::new(logger);
     let ctx = CordisContext::new();
-    registry.register(TestPlugin::new("remove-me"), &ctx).unwrap();
+    registry
+        .register(TestPlugin::new("remove-me"), &ctx)
+        .unwrap();
     registry.unregister("remove-me", &ctx).unwrap();
     assert!(!registry.has_plugin("remove-me"));
+}
+
+struct FailingUnloadPlugin;
+
+impl registry::Plugin for FailingUnloadPlugin {
+    fn apply(&self, _ctx: &CordisContext) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "failing-unload"
+    }
+
+    fn unload(&self, _ctx: &CordisContext) -> Result<(), String> {
+        Err("still busy".to_string())
+    }
+}
+
+#[test]
+fn test_registry_rolls_back_failed_unload() {
+    let registry = registry::RegistryService::new(Arc::new(logger::LoggerService::new("registry")));
+    let ctx = CordisContext::new();
+    registry
+        .register(FailingUnloadPlugin, &ctx)
+        .expect("register plugin");
+    assert!(registry.unregister("failing-unload", &ctx).is_err());
+    assert!(registry.has_plugin("failing-unload"));
 }
 
 #[test]
 fn test_registry_inject() {
     let logger = Arc::new(logger::LoggerService::new("registry-inject"));
     let registry = registry::RegistryService::new(logger);
-    registry.register_inject("db", registry::Inject::with_config("db", 42i32));
+    registry.register_inject(
+        "db",
+        registry::Inject::with_config("db", 42_i32).expect("serialize injection"),
+    );
     assert!(registry.get_inject("db").is_some());
+}
+
+#[test]
+fn test_registry_validates_injections() {
+    let registry = registry::RegistryService::new(Arc::new(logger::LoggerService::new("registry")));
+    let inject = registry::Inject::new("port", serde_json::json!(-1)).with_validator(|value| {
+        value
+            .as_u64()
+            .filter(|port| *port > 0)
+            .map(|_| ())
+            .ok_or_else(|| "port must be positive".to_string())
+    });
+    assert!(registry.try_register_inject("port", inject).is_err());
+    assert!(registry.get_inject("port").is_none());
 }
 
 // -------------------------
@@ -194,7 +240,9 @@ struct MyService {
 }
 impl std::fmt::Debug for MyService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MyService").field("name", &self.name).finish()
+        f.debug_struct("MyService")
+            .field("name", &self.name)
+            .finish()
     }
 }
 impl service::Service for MyService {
@@ -211,7 +259,9 @@ impl service::Service for MyService {
 
 #[test]
 fn test_service_init() {
-    let svc = MyService { name: "my-service".to_string() };
+    let svc = MyService {
+        name: "my-service".to_string(),
+    };
     assert_eq!(svc.name(), "my-service");
     assert!(svc.init().is_ok());
     assert!(svc.check().is_ok());
@@ -224,17 +274,17 @@ fn test_service_init() {
 #[test]
 fn test_disposable_list() {
     use utils::DisposableList;
-    let mut list: DisposableList<i32> = DisposableList::new();
-    list.push(1);
-    list.push(2);
-    list.push(3);
+    let list: DisposableList<i32> = DisposableList::new();
+    let first = list.push(1);
+    let second = list.push(2);
+    let third = list.push(3);
     assert_eq!(list.len(), 3);
+    drop(second);
+    assert_eq!(list.len(), 2);
     let values = list.clear();
-    assert_eq!(values.len(), 3);
-    assert!(values.contains(&1));
-    assert!(values.contains(&2));
-    assert!(values.contains(&3));
+    assert_eq!(values, vec![3, 1]);
     assert_eq!(list.len(), 0);
+    drop((first, third));
 }
 
 #[test]
@@ -249,7 +299,7 @@ fn test_tracker() {
 
 #[test]
 fn test_context_basic() {
-    let mut ctx = CordisContext::new();
+    let ctx = CordisContext::new();
     ctx.set("a", 1);
     assert_eq!(ctx.get("a"), Some(1));
     assert!(ctx.has("a"));
@@ -259,127 +309,143 @@ fn test_context_basic() {
     assert_eq!(ctx.get_timer_name(), Some("t1".to_string()));
 }
 
-// -------------------------
-// Cross-crate smoke tests
-// -------------------------
-
 #[test]
-fn test_timer_timeout() {
-    let timer = cordis_timer::TimerService::new("test-timer");
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let timer_clone = timer.clone();
-    runtime.block_on(async move {
-        let done = Arc::new(AtomicBool::new(false));
-        let d = done.clone();
-        timer_clone.timeout(
-            move || {
-                d.store(true, Ordering::SeqCst);
-            },
-            100,
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(done.load(Ordering::SeqCst));
-    });
+fn test_context_child_scope_shadows_parent() {
+    let parent = CordisContext::new();
+    parent.set("port", 3000);
+    parent.set_typed("name", "parent".to_string());
+    let child = parent.extend();
+    assert_eq!(child.get("port"), Some(3000));
+    child.set("port", 8080);
+    child.set_typed("name", "child".to_string());
+    assert_eq!(child.get("port"), Some(8080));
+    assert_eq!(parent.get("port"), Some(3000));
+    assert_eq!(child.get_typed::<String>("name").as_deref(), Some("child"));
+    assert_eq!(
+        parent.get_typed::<String>("name").as_deref(),
+        Some("parent")
+    );
+    assert_ne!(child.context_id(), parent.context_id());
 }
 
 #[test]
-fn test_timer_interval_stop() {
-    let timer = cordis_timer::TimerService::new("interval-test");
-    let done = Arc::new(AtomicUsize::new(0));
-    let timer_clone = timer.clone();
-    let done_clone = done.clone();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async move {
-        let d = done_clone.clone();
-        let handle = timer_clone.interval(
-            move || {
-                d.fetch_add(1, Ordering::SeqCst);
-            },
-            50,
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        handle.stop();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    });
-    let count = done.load(Ordering::SeqCst);
-    assert!(count >= 2 && count <= 5);
+fn test_fiber_effect_value_and_cleanup() {
+    let fiber = Fiber::new();
+    let value_handle = fiber.effect(|| 42_u64).expect("value effect");
+    assert_eq!(fiber.get::<u64>(), Some(42));
+    drop(value_handle);
+
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let cleanup_counter = Arc::clone(&cleaned);
+    let cleanup_handle = fiber
+        .effect(move || {
+            disposer(move || {
+                cleanup_counter.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .expect("cleanup effect");
+    assert_eq!(fiber.active_effects(), 1);
+    fiber.dispose();
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    drop(cleanup_handle);
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn test_loader_entry_tree() {
-    use cordis_loader::{Entry, EntryConfig, Loader, LoaderConfig};
-    let root = EntryConfig {
-        name: "app".to_string(),
-        children: vec![],
-        groups: vec![],
-        isolates: vec![],
-        disabled: false,
-        config: serde_json::Value::Null,
+fn test_fiber_update_notifies_hooks() {
+    let fiber = Fiber::new();
+    fiber.activate();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let hook_observed = Arc::clone(&observed);
+    let hook = fiber.on_update(move |revision| {
+        hook_observed.store(revision, Ordering::SeqCst);
+    });
+    fiber.update();
+    assert_eq!(fiber.revision(), 1);
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+    assert!(fiber.remove_update_hook(hook));
+}
+
+#[test]
+fn test_logger_unicode_truncation_and_placeholders() {
+    let message = logger::Message {
+        timestamp: 0,
+        msg: "你好 %s %d %o".to_string(),
+        args: vec![
+            Box::new("世界".to_string()),
+            Box::new(7_u64),
+            Box::new(serde_json::json!({"ok": true})),
+        ],
+        level: logger::LoggerLevel::Info,
+        name: "test".to_string(),
     };
-    let mut loader = Loader::new(LoaderConfig { base_url: None });
-    let entry = Arc::new(Entry::new(root.clone()));
-    let _ = entry;
-    loader.load(root);
-    assert_eq!(loader.config().base_url, None);
+    assert_eq!(message.formatted_body(), "你好 世界 7 {\"ok\":true}");
+    let truncated = message.to_string(Some(5));
+    assert_eq!(truncated.chars().count(), 8);
+    assert!(truncated.ends_with("..."));
 }
 
 #[test]
-fn test_module_loader() {
-    use cordis_loader::ModuleLoader;
-    let loader = ModuleLoader::new();
-    loader.add_job("file:///app/main.js");
-    loader.add_job("file:///app/util.js");
-    assert_eq!(loader.jobs().len(), 2);
-    assert_eq!(loader.resolve("file:///test"), "file:///test");
+fn test_events_parallel_is_concurrent() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let logger = Arc::new(logger::LoggerService::new("events-parallel"));
+        let events = events::EventsService::new(logger);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        events.on("slow", move |_| {
+            first_barrier.wait();
+            None
+        });
+        let second_barrier = Arc::clone(&barrier);
+        events.on("slow", move |_| {
+            second_barrier.wait();
+            None
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            events.parallel("slow", vec![]),
+        )
+        .await
+        .expect("parallel handlers must run concurrently");
+    });
 }
 
 #[test]
-fn test_hmr_register_dep() {
-    use cordis_hmr::{Hmr, HmrConfig};
-    let hmr = Hmr::new("test-hmr", HmrConfig::default());
-    hmr.register_dep("main.js", "util.js");
-    hmr.register_dep("main.js", "config.js");
-    assert_eq!(hmr.deps("main.js").len(), 2);
+fn test_event_handle_unregisters_listener() {
+    let events = events::EventsService::new(Arc::new(logger::LoggerService::new("events-off")));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let listener_calls = Arc::clone(&calls);
+    let handle = events.on("event", move |_| {
+        listener_calls.fetch_add(1, Ordering::SeqCst);
+        None
+    });
+    events.emit("event", vec![]);
+    assert!(handle.dispose());
+    events.emit("event", vec![]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn test_hmr_events() {
-    use cordis_hmr::{Hmr, HmrConfig, HmrEvent};
-    let hmr = Hmr::new("test-hmr", HmrConfig::default());
-    hmr.simulate_change("src/app.ts");
-    let events = hmr.events();
-    assert_eq!(events.len(), 1);
-    match &events[0] {
-        HmrEvent::Changed(p) => assert_eq!(p, "src/app.ts"),
-        _ => panic!("expected Changed event"),
-    }
-}
-
-#[test]
-fn test_console_exporter_config() {
-    use cordis_logger_console::ConsoleExporter;
-    let exporter = ConsoleExporter::default();
-    assert_eq!(exporter.config.colors, true);
-    assert_eq!(exporter.config.max_length, Some(1024));
-}
-
-#[test]
-fn test_include_patch() {
-    use std::collections::HashMap;
-    use cordis_include::{IncludePlugin, Patch};
-    let patch = Patch::new("db.host", serde_json::json!("localhost"));
-    let include = IncludePlugin::with_patches("test-include", vec![patch]);
-    let mut config: HashMap<String, serde_json::Value> = HashMap::new();
-    include.apply_patches(&mut config);
-    assert!(config.contains_key("db"));
-}
-
-#[test]
-fn test_group_plugin() {
-    use cordis_group::Group;
-    let mut group = Group::new("test-group");
-    group.add_entry("entry-1");
-    group.add_entry("entry-2");
-    assert_eq!(group.name(), "test-group");
-    assert_eq!(group.entries().len(), 2);
+fn test_async_event_handlers() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let events = events::EventsService::new(Arc::new(logger::LoggerService::new("async")));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let async_calls = Arc::clone(&calls);
+        events.on_async("event", move |_| {
+            let async_calls = Arc::clone(&async_calls);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                async_calls.fetch_add(1, Ordering::SeqCst);
+                Some(Arc::new(42_u64) as events::EventValue)
+            }
+        });
+        let result = events.serial_async("event", vec![]).await;
+        assert_eq!(
+            result.and_then(|value| value.downcast_ref::<u64>().copied()),
+            Some(42)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    });
 }

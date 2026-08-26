@@ -1,49 +1,97 @@
-//! ModuleLoader — module resolution and job tracking.
+//! Rust module-factory registration and path resolution.
 
-use std::sync::{Arc, Mutex};
+use crate::entry::EntryConfig;
+use cordis_core::Plugin;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
-/// Tracks module resolution jobs.
-#[derive(Debug)]
+pub type ModuleFactory =
+    Arc<dyn Fn(&EntryConfig) -> Result<Box<dyn Plugin>, String> + Send + Sync + 'static>;
+
 pub struct ModuleLoader {
-    jobs: Arc<Mutex<Vec<String>>>,
+    jobs: Arc<Mutex<BTreeSet<String>>>,
+    factories: Arc<RwLock<HashMap<String, ModuleFactory>>>,
+    base: Option<PathBuf>,
 }
 
 impl ModuleLoader {
-    /// Create a new empty ModuleLoader.
     pub fn new() -> Self {
-        ModuleLoader {
-            jobs: Arc::new(Mutex::new(Vec::new())),
+        Self {
+            jobs: Arc::new(Mutex::new(BTreeSet::new())),
+            factories: Arc::new(RwLock::new(HashMap::new())),
+            base: None,
         }
     }
 
-    /// Register a module resolution job by URL.
+    pub fn with_base(base: impl Into<PathBuf>) -> Self {
+        Self {
+            base: Some(base.into()),
+            ..Self::new()
+        }
+    }
+
     pub fn add_job(&self, url: &str) {
-        let mut jobs = self.jobs.lock().unwrap();
-        jobs.push(url.to_string());
+        lock(&self.jobs).insert(url.to_string());
     }
 
-    /// Return all registered jobs.
+    pub fn remove_job(&self, url: &str) -> bool {
+        lock(&self.jobs).remove(url)
+    }
+
     pub fn jobs(&self) -> Vec<String> {
-        self.jobs.lock().unwrap().clone()
+        lock(&self.jobs).iter().cloned().collect()
     }
 
-    /// Resolve a path relative to a base.
-    pub fn resolve(&self, path: &str) -> String {
-        if path.starts_with('/')
-            || path.starts_with("http://")
-            || path.starts_with("https://")
-            || path.contains("://")
-        {
-            path.to_string()
-        } else {
-            format!("./{}", path)
+    pub fn register(
+        &self,
+        name: &str,
+        factory: impl Fn(&EntryConfig) -> Result<Box<dyn Plugin>, String> + Send + Sync + 'static,
+    ) -> Result<(), String> {
+        let mut factories = write(&self.factories);
+        if factories.contains_key(name) {
+            return Err(format!("module factory already registered: {name}"));
         }
+        factories.insert(name.to_string(), Arc::new(factory));
+        Ok(())
     }
 
-    /// Check whether a job exists.
+    pub fn unregister(&self, name: &str) -> bool {
+        write(&self.factories).remove(name).is_some()
+    }
+
+    pub fn has_factory(&self, name: &str) -> bool {
+        read(&self.factories).contains_key(name)
+    }
+
+    pub fn instantiate(&self, config: &EntryConfig) -> Result<Box<dyn Plugin>, String> {
+        let factory = read(&self.factories)
+            .get(config.name())
+            .cloned()
+            .ok_or_else(|| format!("module factory not found: {}", config.name()))?;
+        self.add_job(config.name());
+        factory(config)
+    }
+
+    /// Resolve URLs unchanged and normalize local paths against the configured base.
+    pub fn resolve(&self, path: &str) -> String {
+        if path.contains("://") {
+            return path.to_string();
+        }
+        let path = Path::new(path);
+        if path.is_absolute() {
+            return normalize_path(path).to_string_lossy().into_owned();
+        }
+        if let Some(base) = &self.base {
+            return normalize_path(&base.join(path))
+                .to_string_lossy()
+                .into_owned();
+        }
+        format!("./{}", normalize_path(path).to_string_lossy())
+    }
+
     pub fn has_job(&self, url: &str) -> bool {
-        let jobs = self.jobs.lock().unwrap();
-        jobs.iter().any(|j| j == url)
+        lock(&self.jobs).contains(url)
     }
 }
 
@@ -53,20 +101,61 @@ impl Default for ModuleLoader {
     }
 }
 
+impl std::fmt::Debug for ModuleLoader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModuleLoader")
+            .field("base", &self.base)
+            .field("jobs", &lock(&self.jobs).len())
+            .field("factories", &read(&self.factories).len())
+            .finish()
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_module_loader() {
+    fn normalizes_paths_and_deduplicates_jobs() {
         let loader = ModuleLoader::new();
-        loader.add_job("http://example.com/module.js");
-        loader.add_job("http://example.com/other.js");
-
-        assert_eq!(loader.jobs().len(), 2);
-        assert!(loader.has_job("http://example.com/module.js"));
-        assert!(!loader.has_job("http://example.com/missing.js"));
-        assert_eq!(loader.resolve("relative/path.js"), "./relative/path.js");
-        assert_eq!(loader.resolve("/absolute/path.js"), "/absolute/path.js");
+        loader.add_job("module");
+        loader.add_job("module");
+        assert_eq!(loader.jobs(), vec!["module"]);
+        assert_eq!(loader.resolve("a/../b"), "./b");
+        assert_eq!(
+            loader.resolve("https://example.com/a"),
+            "https://example.com/a"
+        );
     }
 }

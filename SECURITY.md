@@ -8,8 +8,7 @@
 
 ## Reporting a Vulnerability
 
-Please report security vulnerabilities to **security@cordis-rs.dev** or open a
-[private vulnerability report](https://github.com/Ricardo-M-L/cordis-rs/security/advisories/new)
+Please open a [private vulnerability report](https://github.com/Ricardo-M-L/cordis-rs/security/advisories/new)
 on GitHub.
 
 We will acknowledge receipt within 48 hours and aim to respond with a fix or

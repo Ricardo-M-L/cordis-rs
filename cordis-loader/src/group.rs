@@ -17,8 +17,18 @@ impl Group {
     }
 
     /// Add an entry to this group.
-    pub fn add_entry(&mut self, entry: &str) {
+    pub fn add_entry(&mut self, entry: &str) -> bool {
+        if self.entries.iter().any(|existing| existing == entry) {
+            return false;
+        }
         self.entries.push(entry.to_string());
+        true
+    }
+
+    pub fn remove_entry(&mut self, entry: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|existing| existing != entry);
+        before != self.entries.len()
     }
 
     /// Return the group's name.

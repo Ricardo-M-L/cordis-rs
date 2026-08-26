@@ -4,22 +4,24 @@ Thanks for your interest in contributing! Here's how to get started:
 
 ## Development Setup
 
+Install Rust 1.85 or newer with the `rustfmt` and `clippy` components.
+
 ```bash
 # 1. Fork and clone
 git clone https://github.com/<your-user>/cordis-rs.git
 cd cordis-rs
 
 # 2. Build
-cargo build --workspace
+cargo check --workspace --all-targets --locked
 
 # 3. Run tests
-cargo test --workspace
+cargo test --workspace --all-targets --locked
 
 # 4. Check formatting
-cargo fmt -- --check
+cargo fmt --all -- --check
 
 # 5. Run clippy
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 ## Package Structure
@@ -46,9 +48,9 @@ We use Conventional Commits:
 
 ## Pull Request Process
 
-1. Create a feature branch from `main`
+1. Create a feature branch from the repository's default branch
 2. Make your changes with tests
-3. Run `cargo test --workspace` and `cargo clippy --workspace`
+3. Run the complete formatting, check, test, and Clippy commands above
 4. Update documentation if needed
 5. Submit the PR
 

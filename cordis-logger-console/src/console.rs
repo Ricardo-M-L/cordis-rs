@@ -36,12 +36,6 @@ pub struct ConsoleExporter {
 }
 
 impl ConsoleExporter {
-    pub fn default() -> Self {
-        ConsoleExporter {
-            config: ConsoleExporterConfig::default(),
-        }
-    }
-
     pub fn new(config: ConsoleExporterConfig) -> Self {
         ConsoleExporter { config }
     }
@@ -71,20 +65,42 @@ impl Exporter for ConsoleExporter {
     fn export(&self, msg: &Message) {
         let reset = if self.config.colors { "\x1b[0m" } else { "" };
         let color = self.level_color(msg.level);
-
-        let mut output = String::new();
-        if self.config.show_time {
-            output.push_str(&format!(
-                "[{}:{}]",
+        let label = self.config.label.as_deref().unwrap_or(&msg.name);
+        let mut output = if self.config.show_time {
+            format!(
+                "[{}.{:03}] [{}] {} {}",
                 msg.timestamp / 1000,
-                (msg.timestamp % 1000) as usize
-            ));
+                msg.timestamp % 1000,
+                msg.level,
+                label,
+                msg.formatted_body()
+            )
+        } else {
+            format!("[{}] {} {}", msg.level, label, msg.formatted_body())
+        };
+        if let Some(max_length) = self.config.max_length {
+            if output.chars().count() > max_length {
+                output = output.chars().take(max_length).collect::<String>() + "...";
+            }
         }
-        output.push_str(&format!(
-            "{}[{}]{} {} {}{}",
-            color, msg.level, reset, msg.name, msg.msg, reset
-        ));
+        eprintln!("{color}{output}{reset}");
+    }
+}
 
-        eprintln!("{}", output);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exporter_exposes_configured_capabilities() {
+        let exporter = ConsoleExporter::new(ConsoleExporterConfig {
+            colors: false,
+            max_length: Some(12),
+            show_time: false,
+            label: Some("app".to_string()),
+        });
+        assert!(!exporter.colors());
+        assert_eq!(exporter.max_length(), Some(12));
+        assert_eq!(exporter.level_color(LoggerLevel::Error), "");
     }
 }

@@ -7,7 +7,7 @@ use std::any::Any;
 /// - `name()` — unique service identifier.
 /// - `init()` — one-time initialisation (called by the framework).
 /// - `check()` — health / liveness check (called periodically or on demand).
-/// - `invoke()` — optional runtime call; default is `Err("not implemented")`.
+/// - `invoke()` — optional runtime call; unsupported services return a typed error string.
 pub trait Service: Send + Sync {
     /// The service's unique name.
     fn name(&self) -> &str;
@@ -22,6 +22,6 @@ pub trait Service: Send + Sync {
     /// Override this method in concrete services to provide custom behaviour.
     /// Default returns an error indicating the service does not support invocation.
     fn invoke(&self, _args: &[Box<dyn Any>]) -> Result<Box<dyn Any>, String> {
-        Err("invoke not implemented".to_string())
+        Err(format!("service {} does not support invoke", self.name()))
     }
 }

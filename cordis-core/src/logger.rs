@@ -1,53 +1,37 @@
-//! Logger — structured logging service for Cordis.
-//!
-//! Mirrors the TypeScript `LoggerService` from cordis-core.
+//! Structured logging with safe formatting and reentrant exporters.
 
+use crate::utils::lock;
 use std::any::Any;
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
-// ---------------------------------------------------------------------------
-// LoggerLevel
-// ---------------------------------------------------------------------------
-
-/// Log severity levels (matches TypeScript `LoggerLevel`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum LoggerLevel {
     Debug = 0,
+    #[default]
     Info = 1,
     Warn = 2,
     Error = 3,
 }
 
-impl Default for LoggerLevel {
-    fn default() -> Self {
-        LoggerLevel::Info
-    }
-}
-
 impl std::fmt::Display for LoggerLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LoggerLevel::Debug => write!(f, "Debug"),
-            LoggerLevel::Info => write!(f, "Info"),
-            LoggerLevel::Warn => write!(f, "Warn"),
-            LoggerLevel::Error => write!(f, "Error"),
-        }
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Debug => "Debug",
+            Self::Info => "Info",
+            Self::Warn => "Warn",
+            Self::Error => "Error",
+        })
     }
 }
 
 impl LoggerLevel {
-    /// Return the numeric value of this level.
     pub fn as_num(&self) -> usize {
         *self as usize
     }
 }
 
-// ---------------------------------------------------------------------------
-// Message
-// ---------------------------------------------------------------------------
-
-/// A single log message.
 #[derive(Debug)]
 pub struct Message {
     pub timestamp: u64,
@@ -58,165 +42,221 @@ pub struct Message {
 }
 
 impl Message {
-    /// Format the message for display, optionally truncating at max_length.
-    pub fn to_string(&self, max_length: Option<usize>) -> String {
-        let mut output = format!(
-            "[{}] {} {} ",
-            self.level,
-            chrono_or_naive_time(self.timestamp),
-            self.name,
-        );
-        output.push_str(&self.msg);
-        if !self.args.is_empty() {
-            output.push_str(" (");
-            let args: Vec<String> = self.args.iter().map(|a| format!("{:?}", a)).collect();
-            output.push_str(&args.join(", "));
-            output.push(')');
-        }
-        if let Some(max_len) = max_length {
-            if output.len() > max_len {
-                output = output[..max_len].to_string() + "...";
+    /// Format `%s`, `%d`, `%o`, and `%%` placeholders. Unknown argument types are
+    /// represented as `<opaque>` instead of leaking implementation-dependent `Any` output.
+    pub fn formatted_body(&self) -> String {
+        let mut output = String::new();
+        let mut chars = self.msg.chars().peekable();
+        let mut argument_index = 0;
+
+        while let Some(ch) = chars.next() {
+            if ch != '%' {
+                output.push(ch);
+                continue;
             }
+            let Some(specifier) = chars.peek().copied() else {
+                output.push('%');
+                break;
+            };
+            if specifier == '%' {
+                chars.next();
+                output.push('%');
+                continue;
+            }
+            if !matches!(specifier, 's' | 'd' | 'o') || argument_index >= self.args.len() {
+                output.push('%');
+                continue;
+            }
+
+            chars.next();
+            output.push_str(&format_argument(
+                self.args[argument_index].as_ref(),
+                specifier,
+            ));
+            argument_index += 1;
+        }
+
+        if argument_index < self.args.len() {
+            let remaining = self.args[argument_index..]
+                .iter()
+                .map(|value| format_argument(value.as_ref(), 'o'))
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str(" (");
+            output.push_str(&remaining);
+            output.push(')');
         }
         output
     }
+
+    pub fn to_string(&self, max_length: Option<usize>) -> String {
+        let output = format!(
+            "[{}] {} {} {}",
+            self.level,
+            format_timestamp(self.timestamp),
+            self.name,
+            self.formatted_body()
+        );
+        truncate_chars(output, max_length)
+    }
 }
 
-fn chrono_or_naive_time(ts_ms: u64) -> String {
-    // Simple millisecond timestamp display (no chrono dependency needed)
-    let secs = ts_ms / 1000;
-    let millis = (ts_ms % 1000) as usize;
-    format!("{}.{:03}", secs, millis)
+fn format_timestamp(timestamp_ms: u64) -> String {
+    format!("{}.{:03}", timestamp_ms / 1000, timestamp_ms % 1000)
 }
 
-// ---------------------------------------------------------------------------
-// Exporter trait
-// ---------------------------------------------------------------------------
+fn truncate_chars(output: String, max_length: Option<usize>) -> String {
+    let Some(max_length) = max_length else {
+        return output;
+    };
+    if output.chars().count() <= max_length {
+        return output;
+    }
+    let mut truncated: String = output.chars().take(max_length).collect();
+    truncated.push_str("...");
+    truncated
+}
 
-/// A log exporter handles messages (print to console, write to file, etc.).
+fn format_argument(value: &(dyn Any + Send + Sync), specifier: char) -> String {
+    macro_rules! numeric {
+        ($($kind:ty),+ $(,)?) => {
+            $(if let Some(value) = value.downcast_ref::<$kind>() {
+                return value.to_string();
+            })+
+        };
+    }
+
+    if let Some(value) = value.downcast_ref::<String>() {
+        return value.clone();
+    }
+    if let Some(value) = value.downcast_ref::<&str>() {
+        return (*value).to_string();
+    }
+    numeric!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64);
+    if let Some(value) = value.downcast_ref::<bool>() {
+        return value.to_string();
+    }
+    if let Some(value) = value.downcast_ref::<char>() {
+        return value.to_string();
+    }
+    if let Some(value) = value.downcast_ref::<serde_json::Value>() {
+        return match specifier {
+            's' => value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_string),
+            _ => value.to_string(),
+        };
+    }
+    "<opaque>".to_string()
+}
+
 pub trait Exporter: Send + Sync {
     fn colors(&self) -> bool;
     fn max_length(&self) -> Option<usize>;
-    fn export(&self, _msg: &Message);
+    fn export(&self, msg: &Message);
 }
 
-// ---------------------------------------------------------------------------
-// LoggerService
-// ---------------------------------------------------------------------------
-
-/// The central logging service. Collects exporters and dispatches messages.
 pub struct LoggerService {
     name: String,
     level: Mutex<LoggerLevel>,
-    exporters: Mutex<Vec<Box<dyn Exporter>>>,
-    buffer: Mutex<VecDeque<Message>>,
+    exporters: Mutex<Vec<Arc<dyn Exporter>>>,
+    buffer: Mutex<VecDeque<Arc<Message>>>,
     buffer_size: usize,
 }
 
 impl LoggerService {
-    /// Create a new LoggerService with the given name.
     pub fn new(name: &str) -> Self {
-        LoggerService {
+        Self::with_buffer_size(name, 1000)
+    }
+
+    pub fn with_buffer_size(name: &str, buffer_size: usize) -> Self {
+        Self {
             name: name.to_string(),
             level: Mutex::new(LoggerLevel::Info),
             exporters: Mutex::new(Vec::new()),
-            buffer: Mutex::new(VecDeque::with_capacity(1000)),
-            buffer_size: 1000,
+            buffer: Mutex::new(VecDeque::with_capacity(buffer_size)),
+            buffer_size,
         }
     }
 
-    /// Create a clone sharing the same internal state (Arc-based).
     pub fn with_name(name: &str) -> Arc<Self> {
-        Arc::new(LoggerService::new(name))
+        Arc::new(Self::new(name))
     }
 
-    /// Set the minimum log level.
     pub fn set_level(&self, level: LoggerLevel) {
-        let mut lvl = self.level.lock().unwrap();
-        *lvl = level;
+        *lock(&self.level) = level;
     }
 
-    /// Add an exporter.
     pub fn add_exporter(&self, exporter: Box<dyn Exporter>) {
-        let mut exps = self.exporters.lock().unwrap();
-        exps.push(exporter);
+        lock(&self.exporters).push(Arc::from(exporter));
     }
 
-    /// Log at info level.
+    pub fn clear_exporters(&self) {
+        lock(&self.exporters).clear();
+    }
+
+    pub fn messages(&self) -> Vec<Arc<Message>> {
+        lock(&self.buffer).iter().cloned().collect()
+    }
+
     pub fn info(&self, msg: &str, args: Vec<Box<dyn Any + Send + Sync>>) {
-        self.log(LogLevelKind::Info, msg, args);
+        self.log(LoggerLevel::Info, msg, args);
     }
 
-    /// Log at warn level.
     pub fn warn(&self, msg: &str, args: Vec<Box<dyn Any + Send + Sync>>) {
-        self.log(LogLevelKind::Warn, msg, args);
+        self.log(LoggerLevel::Warn, msg, args);
     }
 
-    /// Log at error level.
     pub fn error(&self, msg: &str, args: Vec<Box<dyn Any + Send + Sync>>) {
-        self.log(LogLevelKind::Error, msg, args);
+        self.log(LoggerLevel::Error, msg, args);
     }
 
-    /// Log at debug level.
     pub fn debug(&self, msg: &str, args: Vec<Box<dyn Any + Send + Sync>>) {
-        self.log(LogLevelKind::Debug, msg, args);
+        self.log(LoggerLevel::Debug, msg, args);
     }
 
-    fn log(&self, kind: LogLevelKind, msg: &str, args: Vec<Box<dyn Any + Send + Sync>>) {
-        let level = *self.level.lock().unwrap();
-        if kind.to_level() < level {
+    fn log(&self, level: LoggerLevel, msg: &str, args: Vec<Box<dyn Any + Send + Sync>>) {
+        if level < *lock(&self.level) {
             return;
         }
 
-        let message = Message {
+        let message = Arc::new(Message {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
             msg: msg.to_string(),
             args,
-            level: kind.to_level(),
+            level,
             name: self.name.clone(),
-        };
+        });
 
-        let exps = self.exporters.lock().unwrap();
-        for exporter in exps.iter() {
-            exporter.export(&message);
+        // Clone exporter Arcs before callbacks so an exporter can safely reenter the logger.
+        let exporters = lock(&self.exporters).clone();
+        for exporter in exporters {
+            let message = Arc::clone(&message);
+            let _ = catch_unwind(AssertUnwindSafe(|| exporter.export(&message)));
         }
 
-        let mut buf = self.buffer.lock().unwrap();
-        buf.push_back(message);
-        while buf.len() > self.buffer_size {
-            buf.pop_front();
+        let mut buffer = lock(&self.buffer);
+        if self.buffer_size == 0 {
+            return;
         }
-    }
-}
-
-/// Internal helper to map method names to levels.
-enum LogLevelKind {
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl LogLevelKind {
-    fn to_level(&self) -> LoggerLevel {
-        match self {
-            LogLevelKind::Debug => LoggerLevel::Debug,
-            LogLevelKind::Info => LoggerLevel::Info,
-            LogLevelKind::Warn => LoggerLevel::Warn,
-            LogLevelKind::Error => LoggerLevel::Error,
+        buffer.push_back(message);
+        while buffer.len() > self.buffer_size {
+            buffer.pop_front();
         }
     }
 }
 
 impl std::fmt::Debug for LoggerService {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let level = *self.level.lock().unwrap();
-        f.debug_struct("LoggerService")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoggerService")
             .field("name", &self.name)
-            .field("level", &level)
+            .field("level", &*lock(&self.level))
+            .field("exporters", &lock(&self.exporters).len())
+            .field("buffered", &lock(&self.buffer).len())
             .finish()
     }
 }

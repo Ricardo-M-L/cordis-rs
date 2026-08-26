@@ -14,5 +14,4 @@
 .DS_Store
 Thumbs.db
 
-# Cargo
-Cargo.lock
+# The workspace includes an executable CLI, so the root Cargo.lock is tracked.
