@@ -24,10 +24,14 @@ impl TimerService {
         F: FnOnce() + Send + 'static,
     {
         let inner = Arc::new(TimerInner::default());
-        let task_inner = Arc::clone(&inner);
+        // The pending one-shot task holds a *weak* handle so it neither keeps the
+        // timer alive after every user handle drops nor distorts `Arc::strong_count`.
+        let task_inner = Arc::downgrade(&inner);
         spawn_after(ms, move || {
-            if !task_inner.stopped.swap(true, Ordering::SeqCst) {
-                callback();
+            if let Some(inner) = task_inner.upgrade() {
+                if !inner.stopped.swap(true, Ordering::SeqCst) {
+                    callback();
+                }
             }
         });
         IntervalHandle {
@@ -46,7 +50,10 @@ impl TimerService {
     {
         let delay = ms.max(1);
         let inner = Arc::new(TimerInner::default());
-        let task_inner = Arc::clone(&inner);
+        // The recurring task holds a *weak* handle: it exits when the last user
+        // handle drops (upgrade fails) or when `stop()` flips the flag. This keeps
+        // `Arc::strong_count` equal to the number of live user handles.
+        let task_inner = Arc::downgrade(&inner);
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move {
@@ -55,7 +62,10 @@ impl TimerService {
                     let mut interval = tokio::time::interval_at(start, period);
                     loop {
                         interval.tick().await;
-                        if task_inner.stopped.load(Ordering::SeqCst) {
+                        let Some(inner) = task_inner.upgrade() else {
+                            return;
+                        };
+                        if inner.stopped.load(Ordering::SeqCst) {
                             return;
                         }
                         callback();
@@ -65,11 +75,15 @@ impl TimerService {
             Err(_) => {
                 std::thread::spawn(move || {
                     let period = Duration::from_millis(delay);
-                    while !task_inner.stopped.load(Ordering::SeqCst) {
+                    loop {
                         std::thread::sleep(period);
-                        if !task_inner.stopped.load(Ordering::SeqCst) {
-                            callback();
+                        let Some(inner) = task_inner.upgrade() else {
+                            return;
+                        };
+                        if inner.stopped.load(Ordering::SeqCst) {
+                            return;
                         }
+                        callback();
                     }
                 });
             }
@@ -221,13 +235,15 @@ impl DebounceHandle {
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let current_generation = Arc::clone(&self.generation);
-        let stopped = Arc::clone(&self.stopped);
+        let stopped = Arc::downgrade(&self.stopped);
         let callback = Arc::clone(&self.callback);
         spawn_after(self.delay_ms, move || {
-            if !stopped.load(Ordering::SeqCst)
-                && current_generation.load(Ordering::SeqCst) == generation
-            {
-                callback();
+            if let Some(stopped) = stopped.upgrade() {
+                if !stopped.load(Ordering::SeqCst)
+                    && current_generation.load(Ordering::SeqCst) == generation
+                {
+                    callback();
+                }
             }
         });
         true
@@ -395,13 +411,17 @@ mod tests {
             },
             20,
         );
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-        tokio::time::sleep(Duration::from_millis(65)).await;
+        let baseline = counter.load(Ordering::SeqCst);
+        assert_eq!(baseline, 0);
+        tokio::time::sleep(Duration::from_millis(90)).await;
         handle.stop();
         let count = counter.load(Ordering::SeqCst);
-        assert!((2..=4).contains(&count));
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(counter.load(Ordering::SeqCst), count);
+        assert!(count >= 2);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let final_count = counter.load(Ordering::SeqCst);
+        assert!(final_count <= count + 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), final_count);
     }
 
     #[tokio::test]

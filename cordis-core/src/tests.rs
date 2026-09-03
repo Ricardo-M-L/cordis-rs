@@ -967,6 +967,27 @@ fn test_async_event_handlers() {
 }
 
 #[test]
+fn test_events_emit_runs_async_handlers() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let events = events::EventsService::new(Arc::new(logger::LoggerService::new("emit-async")));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let async_calls = Arc::clone(&calls);
+        events.on_async("emit-async", move |_| {
+            let async_calls = Arc::clone(&async_calls);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                async_calls.fetch_add(1, Ordering::SeqCst);
+                Some(Arc::new("ignored") as events::EventValue)
+            }
+        });
+        events.emit("emit-async", vec![]);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
 fn test_events_serial_sync_panics_do_not_abort_chain() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime.block_on(async {
@@ -999,7 +1020,9 @@ fn test_events_serial_sync_panics_do_not_abort_chain() {
             solo_calls_for_panic.fetch_add(1, Ordering::SeqCst);
             panic!("boom");
         });
-        let result = solo_events.serial("sync-only-panic", vec![Arc::new(1_i32)]).await;
+        let result = solo_events
+            .serial("sync-only-panic", vec![Arc::new(1_i32)])
+            .await;
         assert!(result.is_none());
         assert_eq!(solo_calls.load(Ordering::SeqCst), 1);
     });

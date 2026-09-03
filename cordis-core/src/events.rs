@@ -310,8 +310,11 @@ impl EventsService {
     }
 
     /// Invoke synchronous handlers inline and schedule asynchronous handlers on the
-    /// active Tokio runtime. The handler list is cloned before invocation, so handlers
-    /// may safely register or remove listeners reentrantly.
+    /// active Tokio runtime. Async handler return values and early-stop signals are
+    /// not propagated because `emit()` is fire-and-forget by design.
+    ///
+    /// The handler list is cloned before invocation, so handlers may safely
+    /// register or remove listeners reentrantly.
     pub fn emit(&self, name: &str, args: EventArgs) {
         self.emit_entries(self.resolve(name, None), args);
     }
@@ -331,8 +334,14 @@ impl EventsService {
                 Handler::Async(handler) => match tokio::runtime::Handle::try_current() {
                     Ok(runtime) => {
                         let args = args.clone();
+                        let logger = Arc::clone(&self.logger);
                         runtime.spawn(async move {
-                            let _ = handler(args).await;
+                            if handler(args).await.is_some() {
+                                logger.warn(
+                                    "emit() ignores async handler return values; use serial() if you need bail/stop semantics",
+                                    vec![],
+                                );
+                            }
                         });
                     }
                     Err(error) => self.logger.error(
@@ -436,9 +445,8 @@ impl EventsService {
             let result = match entry.handler {
                 Handler::Sync(handler) => {
                     let args = args.clone();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handler(args)
-                    }));
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(args)));
                     match result {
                         Ok(result) => result,
                         Err(error) => {

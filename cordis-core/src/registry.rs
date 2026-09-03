@@ -459,9 +459,7 @@ impl RegistryService {
             .into_iter()
             .rev()
             .find_map(|(owner_id, owner, value, check)| {
-                let Some(owner) = owner else {
-                    return None;
-                };
+                let owner = owner?;
                 if owner_id != current_owner && !owner.is_active() {
                     return None;
                 }
@@ -492,16 +490,13 @@ impl RegistryService {
         };
 
         candidates.is_some_and(|records| {
-            records
-                .into_iter()
-                .rev()
-                .any(|(owner_id, owner, check)| {
-                    let Some(owner) = owner else {
-                        return false;
-                    };
-                    (owner_id == current_owner || owner.is_active())
-                        && check.is_none_or(|check| check().is_ok())
-                })
+            records.into_iter().rev().any(|(owner_id, owner, check)| {
+                let Some(owner) = owner else {
+                    return false;
+                };
+                (owner_id == current_owner || owner.is_active())
+                    && check.is_none_or(|check| check().is_ok())
+            })
         })
     }
 
