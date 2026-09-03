@@ -16,9 +16,9 @@ An experimental Rust adaptation of [Cordis](https://github.com/cordisjs/cordis),
 - **Registry**: isolated plugin/service slots, Service init/check integration, named dependency checks, duplicate protection, and staged replacement.
 - **Logger**: `%s`, `%d`, `%o` formatting, Unicode-safe truncation, bounded message history, and reentrant exporters.
 - **Timer**: stoppable timeout/interval streams and reusable debounce/throttle handles.
-- **Include**: JSON, YAML, and TOML file loading plus safe object/array patches.
+- **Include**: JSON, YAML, and TOML file loading plus safe object/array patches, bounded file/patch limits, and optional strict path behavior.
 - **Loader**: entry-tree activation through statically registered Rust module factories, resolved Context intercepts, scoped contexts, disabled-tree propagation, unload, staged reload, and side-effect rollback.
-- **HMR**: recursive operating-system file watching, debounce, ignored paths, callbacks, and transitive dependency reload events. The application remains responsible for mapping reload events to its module factories.
+- **HMR**: recursive operating-system file watching, debounce, ignored paths, callbacks, bounded event queue, and transitive dependency reload events with panic-safe callback execution. The application remains responsible for mapping reload events to its module factories.
 - **Create**: executable project generator with overwrite protection, built-in or Git templates, optional Git initialization, and release-profile generation.
 
 ## Workspace
@@ -70,6 +70,15 @@ assert!(cleaned.load(Ordering::SeqCst));
 cargo run -p cordis-create -- my-cordis-app --target /tmp/my-cordis-app --git
 ```
 
+To generate a project that compiles against a local checkout or a released version:
+
+```bash
+cargo run -p cordis-create -- my-cordis-app --core-path ../cordis-core
+cargo run -p cordis-create -- my-cordis-app --core-version 0.1.0
+```
+
+Without these flags, `cordis-create` keeps the existing behavior of using the repository git source.
+
 Existing non-empty directories are preserved unless `--force` is explicitly supplied.
 
 ## Runtime integration boundary
@@ -81,6 +90,61 @@ This explicit lifecycle replaces Cordis' JavaScript Proxy-based service lookup. 
 ## HMR boundary
 
 `cordis-hmr` performs real filesystem observation and emits `Changed`, `Removed`, and transitive `Reload` events. Rust cannot safely unload arbitrary statically linked code. Applications should register module factories with `cordis-loader` and call `Loader::reload()` in response to an accepted reload event.
+
+## HMR backpressure and observability
+
+Since callbacks can be slow, `cordis-hmr` uses a bounded queue (`queue_capacity`, default `1024`) between the watcher callback and worker thread. Slow consumers therefore drop events instead of blocking file-system processing.
+
+```rust
+use cordis_hmr::{Hmr, HmrConfig};
+
+let hmr = Hmr::new(
+    "app",
+    HmrConfig {
+        root: Some("./src".into()),
+        base: Some("./src".into()),
+        debounce: 100,
+        ignored: vec![".DS_Store".into()],
+        queue_capacity: 1024,
+    },
+);
+
+hmr.watch().unwrap();
+hmr.on_event(|event| println!("{event}"));
+
+let stats = hmr.stats();
+assert!(stats.queue_depth <= stats.queue_capacity);
+```
+
+Use `stats()` for SRE diagnostics (`total_received`, `total_emitted`, `total_dropped`, `total_errors`, `callback_panics`, and queue depth/peak).
+
+## Include hardening
+
+`cordis-include` adds security-oriented options for configuration loading:
+
+- `max_file_bytes` bounds input size (default 1MB)
+- `max_patch_depth` bounds path depth (default 64)
+- `strict` mode for scalar-segment safety in intermediate path traversal
+
+```rust
+use cordis_include::{IncludePlugin, Patch};
+use serde_json::json;
+use std::collections::HashMap;
+
+let plugin = IncludePlugin::with_options(
+    "app-config",
+    vec![Patch::new("server.port", json!(3000))],
+    2 * 1024 * 1024,
+    32,
+    true,
+);
+
+let mut config: HashMap<String, serde_json::Value> = [
+    ("server".to_string(), json!({"port": 80})),
+].into_iter().collect();
+
+plugin.apply_patches(&mut config).expect("apply patches");
+```
 
 ## License
 

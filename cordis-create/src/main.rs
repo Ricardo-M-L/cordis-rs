@@ -32,6 +32,14 @@ struct Arguments {
     #[arg(long)]
     mirror: Option<String>,
 
+    /// Use a local path dependency for generated projects.
+    #[arg(long)]
+    core_path: Option<String>,
+
+    /// Use crates.io version for generated projects.
+    #[arg(long)]
+    core_version: Option<String>,
+
     #[arg(long)]
     prod: bool,
 
@@ -63,6 +71,8 @@ fn main() {
         git: arguments.git,
         forced: arguments.force,
         mirror: arguments.mirror,
+        core_path: arguments.core_path,
+        core_version: arguments.core_version,
         prod: arguments.prod,
         yes: arguments.yes,
     });

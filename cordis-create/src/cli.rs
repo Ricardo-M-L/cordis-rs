@@ -12,6 +12,8 @@ pub struct CreateOptions {
     pub git: bool,
     pub forced: bool,
     pub mirror: Option<String>,
+    pub core_path: Option<String>,
+    pub core_version: Option<String>,
     pub prod: bool,
     pub yes: bool,
 }
@@ -25,6 +27,8 @@ impl Default for CreateOptions {
             git: false,
             forced: false,
             mirror: None,
+            core_path: None,
+            core_version: None,
             prod: false,
             yes: false,
         }
@@ -36,6 +40,7 @@ pub enum CreateError {
     InvalidName(String),
     TargetNotEmpty(PathBuf),
     UnsupportedTemplate(String),
+    InvalidDependency(String),
     Io(std::io::Error),
     Git(String),
 }
@@ -54,6 +59,7 @@ impl std::fmt::Display for CreateError {
             Self::UnsupportedTemplate(template) => {
                 write!(formatter, "unsupported template: {template}")
             }
+            Self::InvalidDependency(details) => write!(formatter, "{details}"),
             Self::Io(error) => write!(formatter, "project generation failed: {error}"),
             Self::Git(error) => write!(formatter, "git command failed: {error}"),
         }
@@ -80,6 +86,7 @@ impl CreateCli {
     /// Generate a project and return errors to the caller.
     pub fn try_generate_template(&self, target: impl AsRef<Path>) -> Result<PathBuf, CreateError> {
         validate_name(&self.options.name)?;
+        self.validate_dependency_options()?;
         let target = target.as_ref().to_path_buf();
         prepare_target(&target, self.options.forced)?;
 
@@ -148,6 +155,7 @@ impl CreateCli {
         }
 
         std::fs::create_dir_all(target.join("src"))?;
+        let core_dependency = self.cordis_core_dependency()?;
         let cargo_toml = format!(
             r#"[package]
 name = "{}"
@@ -155,9 +163,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cordis-core = {{ git = "https://github.com/Ricardo-M-L/cordis-rs", package = "cordis-core" }}
+{}
 "#,
-            self.options.name
+            self.options.name, core_dependency
         );
         std::fs::write(target.join("Cargo.toml"), cargo_toml)?;
         let main_rs = format!(
@@ -172,6 +180,44 @@ fn main() {{
         );
         std::fs::write(target.join("src/main.rs"), main_rs)?;
         std::fs::write(target.join(".gitignore"), "/target\n")?;
+        Ok(())
+    }
+
+    fn cordis_core_dependency(&self) -> Result<String, CreateError> {
+        if let Some(path) = &self.options.core_path {
+            return Ok(format!("cordis-core = {{ path = \"{}\", package = \"cordis-core\" }}", path));
+        }
+
+        if let Some(version) = &self.options.core_version {
+            return Ok(format!("cordis-core = \"{}\"", version));
+        }
+
+        Ok(
+            "cordis-core = { git = \"https://github.com/Ricardo-M-L/cordis-rs\", package = \"cordis-core\" }"
+                .to_string(),
+        )
+    }
+
+    fn validate_dependency_options(&self) -> Result<(), CreateError> {
+        if self.options.core_path.is_some() && self.options.core_version.is_some() {
+            return Err(CreateError::InvalidDependency(
+                "--core-path and --core-version cannot be used together".to_string(),
+            ));
+        }
+        if let Some(path) = &self.options.core_path {
+            if path.trim().is_empty() {
+                return Err(CreateError::InvalidDependency(
+                    "please pass a non-empty --core-path".to_string(),
+                ));
+            }
+        }
+        if let Some(version) = &self.options.core_version {
+            if version.trim().is_empty() {
+                return Err(CreateError::InvalidDependency(
+                    "please pass a non-empty --core-version".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -301,6 +347,54 @@ mod tests {
         assert!(manifest.contains("[profile.release]"));
         assert!(result.join("src/main.rs").exists());
         std::fs::remove_dir_all(target).expect("remove generated project");
+    }
+
+    #[test]
+    fn allows_local_path_dependency_override() {
+        let cli = CreateCli::new(CreateOptions {
+            name: "local-core-app".to_string(),
+            core_path: Some("../cordis-core".to_string()),
+            ..CreateOptions::default()
+        });
+        let target = temp_target("path-dep");
+        let result = cli
+            .try_generate_template(&target)
+            .expect("generate project");
+        let manifest =
+            std::fs::read_to_string(result.join("Cargo.toml")).expect("read generated manifest");
+        assert!(manifest.contains("cordis-core = { path = \"../cordis-core\""));
+        std::fs::remove_dir_all(target).expect("remove generated project");
+    }
+
+    #[test]
+    fn allows_version_dependency_override() {
+        let cli = CreateCli::new(CreateOptions {
+            name: "crates-io-app".to_string(),
+            core_version: Some("0.1.0".to_string()),
+            ..CreateOptions::default()
+        });
+        let target = temp_target("crate-version");
+        let result = cli
+            .try_generate_template(&target)
+            .expect("generate project");
+        let manifest =
+            std::fs::read_to_string(result.join("Cargo.toml")).expect("read generated manifest");
+        assert!(manifest.contains("cordis-core = \"0.1.0\""));
+        std::fs::remove_dir_all(target).expect("remove generated project");
+    }
+
+    #[test]
+    fn rejects_invalid_dependency_overrides() {
+        let cli = CreateCli::new(CreateOptions {
+            name: "invalid-override".to_string(),
+            core_path: Some("".to_string()),
+            core_version: Some("0.1.0".to_string()),
+            ..CreateOptions::default()
+        });
+        assert!(matches!(
+            cli.try_generate_template(temp_target("invalid")),
+            Err(CreateError::InvalidDependency(_))
+        ));
     }
 
     #[test]

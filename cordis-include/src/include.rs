@@ -11,6 +11,7 @@ pub enum IncludeError {
     Parse(String),
     RootMustBeObject(PathBuf),
     InvalidPatch(String),
+    FileTooLarge(PathBuf, u64),
 }
 
 impl std::fmt::Display for IncludeError {
@@ -33,6 +34,14 @@ impl std::fmt::Display for IncludeError {
                 )
             }
             Self::InvalidPatch(error) => write!(formatter, "invalid configuration patch: {error}"),
+            Self::FileTooLarge(path, size) => {
+                write!(
+                    formatter,
+                    "configuration file too large: {} ({} bytes)",
+                    path.display(),
+                    size
+                )
+            }
         }
     }
 }
@@ -44,6 +53,9 @@ impl From<std::io::Error> for IncludeError {
         Self::Io(error)
     }
 }
+
+const DEFAULT_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MAX_PATCH_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Patch {
@@ -67,16 +79,24 @@ impl Patch {
         &self.value
     }
 
-    /// Apply a dot-separated path. Scalar intermediate values are safely replaced
-    /// with objects, so paths such as `a.b` work even when `a` was previously numeric.
+    /// Apply a dot-separated path.
+    /// - Default mode is lenient (legacy behavior): scalar values on intermediate nodes are
+    ///   replaced with objects to keep patching flexible.
+    /// - Strict mode keeps intermediate scalar nodes and returns an error.
     pub fn apply(&self, config: &mut serde_json::Value) -> Result<(), IncludeError> {
-        let mut updated = config.clone();
-        self.apply_in_place(&mut updated)?;
-        *config = updated;
-        Ok(())
+        self.apply_with_options(config, false, DEFAULT_MAX_PATCH_DEPTH)
     }
 
-    fn apply_in_place(&self, config: &mut serde_json::Value) -> Result<(), IncludeError> {
+    pub fn apply_with_options(
+        &self,
+        config: &mut serde_json::Value,
+        strict: bool,
+        max_depth: usize,
+    ) -> Result<(), IncludeError> {
+        self.apply_in_place(config, strict, max_depth)
+    }
+
+    fn path_parts(&self) -> Result<Vec<&str>, IncludeError> {
         let parts: Vec<_> = self
             .path
             .split('.')
@@ -87,16 +107,35 @@ impl Patch {
                 "patch path cannot be empty".to_string(),
             ));
         }
+        Ok(parts)
+    }
 
-        let mut current = config;
+    fn apply_in_place(
+        &self,
+        config: &mut serde_json::Value,
+        strict: bool,
+        max_depth: usize,
+    ) -> Result<(), IncludeError> {
+        let parts = self.path_parts()?;
+        if parts.len() > max_depth {
+            return Err(IncludeError::InvalidPatch(format!(
+                "patch path exceeds max depth: {} > {}",
+                parts.len(),
+                max_depth
+            )));
+        }
+
+        let mut updated = config.clone();
+        let mut current = &mut updated;
         for (index, part) in parts.iter().enumerate() {
             let last = index + 1 == parts.len();
             if last {
-                set_child(current, part, self.value.clone())?;
+                set_child(current, part, self.value.clone(), strict)?;
             } else {
-                current = child_mut(current, part)?;
+                current = child_mut(current, part, strict)?;
             }
         }
+        *config = updated;
         Ok(())
     }
 }
@@ -104,6 +143,7 @@ impl Patch {
 fn child_mut<'a>(
     current: &'a mut serde_json::Value,
     part: &str,
+    strict: bool,
 ) -> Result<&'a mut serde_json::Value, IncludeError> {
     if current.is_array() {
         if let Ok(index) = part.parse::<usize>() {
@@ -115,6 +155,11 @@ fn child_mut<'a>(
         }
         return Err(IncludeError::InvalidPatch(format!(
             "array segment must be an index, got {part}"
+        )));
+    }
+    if strict && !current.is_object() {
+        return Err(IncludeError::InvalidPatch(format!(
+            "strict mode disallows replacing scalar path segment: {part}"
         )));
     }
     if !current.is_object() {
@@ -131,6 +176,7 @@ fn set_child(
     current: &mut serde_json::Value,
     part: &str,
     value: serde_json::Value,
+    strict: bool,
 ) -> Result<(), IncludeError> {
     if current.is_array() {
         if let Ok(index) = part.parse::<usize>() {
@@ -143,6 +189,11 @@ fn set_child(
         }
         return Err(IncludeError::InvalidPatch(format!(
             "array segment must be an index, got {part}"
+        )));
+    }
+    if strict && !current.is_object() {
+        return Err(IncludeError::InvalidPatch(format!(
+            "strict mode disallows replacing scalar path target: {part}"
         )));
     }
     if !current.is_object() {
@@ -158,6 +209,9 @@ fn set_child(
 pub struct IncludePlugin {
     name: String,
     patches: Vec<Patch>,
+    max_file_bytes: u64,
+    max_patch_depth: usize,
+    strict: bool,
 }
 
 impl IncludePlugin {
@@ -165,6 +219,9 @@ impl IncludePlugin {
         Self {
             name: name.to_string(),
             patches: Vec::new(),
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_patch_depth: DEFAULT_MAX_PATCH_DEPTH,
+            strict: false,
         }
     }
 
@@ -172,7 +229,38 @@ impl IncludePlugin {
         Self {
             name: name.to_string(),
             patches,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_patch_depth: DEFAULT_MAX_PATCH_DEPTH,
+            strict: false,
         }
+    }
+
+    pub fn with_options(
+        name: &str,
+        patches: Vec<Patch>,
+        max_file_bytes: u64,
+        max_patch_depth: usize,
+        strict: bool,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            patches,
+            max_file_bytes,
+            max_patch_depth,
+            strict,
+        }
+    }
+
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
+    }
+
+    pub fn max_patch_depth(&self) -> usize {
+        self.max_patch_depth
+    }
+
+    pub fn strict(&self) -> bool {
+        self.strict
     }
 
     pub fn apply_patches(
@@ -185,7 +273,7 @@ impl IncludePlugin {
             .collect::<serde_json::Map<String, serde_json::Value>>();
         let mut value = serde_json::Value::Object(map);
         for patch in &self.patches {
-            patch.apply(&mut value)?;
+            patch.apply_with_options(&mut value, self.strict, self.max_patch_depth)?;
         }
         if let serde_json::Value::Object(map) = value {
             config.clear();
@@ -200,6 +288,11 @@ impl IncludePlugin {
         path: impl AsRef<Path>,
     ) -> Result<HashMap<String, serde_json::Value>, IncludeError> {
         let path = path.as_ref();
+        let size = path.metadata()?.len();
+        if size > self.max_file_bytes {
+            return Err(IncludeError::FileTooLarge(path.to_path_buf(), size));
+        }
+
         let source = std::fs::read_to_string(path)?;
         let extension = path
             .extension()
@@ -264,6 +357,25 @@ mod tests {
     }
 
     #[test]
+    fn patch_replaces_scalar_intermediate_in_strict_mode() {
+        let mut config = serde_json::json!({"server": 1});
+        let result = Patch::new("server.port", serde_json::json!(8080)).apply_with_options(
+            &mut config,
+            true,
+            DEFAULT_MAX_PATCH_DEPTH,
+        );
+        assert!(matches!(result, Err(IncludeError::InvalidPatch(_))));
+    }
+
+    #[test]
+    fn patch_checks_max_depth_limit() {
+        let mut config = serde_json::json!({"a": {}});
+        let result =
+            Patch::new("a.b.c.d", serde_json::json!(1)).apply_with_options(&mut config, false, 2);
+        assert!(matches!(result, Err(IncludeError::InvalidPatch(_))));
+    }
+
+    #[test]
     fn patch_updates_array_index() {
         let mut config = serde_json::json!({"servers": [{"port": 1}]});
         Patch::new("servers.0.port", serde_json::json!(8080))
@@ -304,5 +416,38 @@ mod tests {
             .expect("load TOML");
         std::fs::remove_file(path).expect("remove TOML fixture");
         assert_eq!(config["server"]["port"], 3000);
+    }
+
+    #[test]
+    fn blocks_overly_large_files() {
+        let path = temp_path("json");
+        std::fs::write(&path, "{ \"a\": 1 }").expect("write tiny fixture");
+        let plugin = IncludePlugin::with_options("json", Vec::new(), 1, DEFAULT_MAX_PATCH_DEPTH, false);
+        let result = plugin.load_path(&path);
+        assert!(matches!(result, Err(IncludeError::FileTooLarge(_, _))));
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn validates_patch_depth_limit_from_plugin() {
+        let plugin = IncludePlugin::with_options(
+            "depth",
+            vec![Patch::new("a.b.c", serde_json::json!(1))],
+            DEFAULT_MAX_FILE_BYTES,
+            2,
+            false,
+        );
+        let mut config = HashMap::new();
+        config.insert("a".to_string(), serde_json::json!({}));
+        let result = plugin.apply_patches(&mut config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_depth_accessors() {
+        let plugin = IncludePlugin::with_options("x", Vec::new(), 7, 5, true);
+        assert_eq!(plugin.max_file_bytes(), 7);
+        assert_eq!(plugin.max_patch_depth(), 5);
+        assert!(plugin.strict());
     }
 }
