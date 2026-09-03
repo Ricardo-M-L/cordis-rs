@@ -436,12 +436,22 @@ impl EventsService {
             let result = match entry.handler {
                 Handler::Sync(handler) => {
                     let args = args.clone();
-                    match tokio::task::spawn_blocking(move || handler(args)).await {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handler(args)
+                    }));
+                    match result {
                         Ok(result) => result,
                         Err(error) => {
+                            let message = if let Some(message) = error.downcast_ref::<String>() {
+                                message.clone()
+                            } else if let Some(message) = error.downcast_ref::<&'static str>() {
+                                (*message).to_string()
+                            } else {
+                                "unknown panic payload".to_string()
+                            };
                             self.logger.error(
-                                "serial event handler failed: %s",
-                                vec![Box::new(error.to_string())],
+                                "serial event handler panicked: %s",
+                                vec![Box::new(message)],
                             );
                             None
                         }

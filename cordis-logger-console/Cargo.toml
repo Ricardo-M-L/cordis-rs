@@ -12,4 +12,3 @@ repository = "https://github.com/Ricardo-M-L/cordis-rs"
 [dependencies]
 cordis-core = { version = "0.1.0", path = "../cordis-core" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"

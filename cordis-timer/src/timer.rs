@@ -127,6 +127,14 @@ impl IntervalHandle {
     }
 }
 
+impl Drop for IntervalHandle {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            self.stop();
+        }
+    }
+}
+
 impl std::fmt::Debug for IntervalHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -170,6 +178,12 @@ impl IntervalStream {
 
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for IntervalStream {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -226,6 +240,18 @@ impl DebounceHandle {
 
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+
+    fn is_last_handle(&self) -> bool {
+        Arc::strong_count(&self.stopped) == 1
+    }
+}
+
+impl Drop for DebounceHandle {
+    fn drop(&mut self) {
+        if self.is_last_handle() {
+            self.stop();
+        }
     }
 }
 
@@ -294,6 +320,18 @@ impl ThrottleHandle {
             .last_run
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn is_last_handle(&self) -> bool {
+        Arc::strong_count(&self.stopped) == 1
+    }
+}
+
+impl Drop for ThrottleHandle {
+    fn drop(&mut self) {
+        if self.is_last_handle() {
+            self.stop();
+        }
     }
 }
 
@@ -382,6 +420,30 @@ mod tests {
         debounced.call();
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn interval_handle_stops_when_last_reference_drops() {
+        let timer = TimerService::new("drop-interval");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let callback_counter = Arc::clone(&counter);
+        let handle = timer.interval(
+            move || {
+                callback_counter.fetch_add(1, Ordering::SeqCst);
+            },
+            10,
+        );
+        let handle_clone = handle.clone();
+
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let running_count = counter.load(Ordering::SeqCst);
+        assert!(running_count > 0);
+
+        drop(handle_clone);
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let stopped_count = counter.load(Ordering::SeqCst);
+        assert_eq!(running_count, stopped_count);
     }
 
     #[test]

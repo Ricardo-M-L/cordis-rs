@@ -967,6 +967,45 @@ fn test_async_event_handlers() {
 }
 
 #[test]
+fn test_events_serial_sync_panics_do_not_abort_chain() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let logger = Arc::new(logger::LoggerService::new("events-sync-panic"));
+        let events = events::EventsService::new(logger);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let calls_for_panic = Arc::clone(&calls);
+        events.on("sync-panic", move |_| {
+            calls_for_panic.fetch_add(1, Ordering::SeqCst);
+            panic!("boom");
+        });
+        let calls_for_ok = Arc::clone(&calls);
+        events.on("sync-panic", move |_| {
+            calls_for_ok.fetch_add(1, Ordering::SeqCst);
+            Some(Arc::new("ok") as events::EventValue)
+        });
+        let result = events.serial("sync-panic", vec![]).await;
+        assert_eq!(
+            result.and_then(|value| value.downcast_ref::<&str>().copied()),
+            Some("ok")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let logger = Arc::new(logger::LoggerService::new("events-sync-only-panic"));
+        let solo_events = events::EventsService::new(logger);
+        let solo_calls = Arc::new(AtomicUsize::new(0));
+        let solo_calls_for_panic = Arc::clone(&solo_calls);
+        solo_events.on("sync-only-panic", move |_| {
+            solo_calls_for_panic.fetch_add(1, Ordering::SeqCst);
+            panic!("boom");
+        });
+        let result = solo_events.serial("sync-only-panic", vec![Arc::new(1_i32)]).await;
+        assert!(result.is_none());
+        assert_eq!(solo_calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
 fn test_waterfall_middleware_chain() {
     // Mirrors upstream events.spec.ts 'ctx.waterfall()':
     // (value, next) => value + next() composed over an innermost callback

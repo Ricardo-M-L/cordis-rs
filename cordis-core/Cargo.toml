@@ -13,6 +13,9 @@ keywords = ["cordis", "framework", "fiber", "events", "logger"]
 categories = ["asynchronous", "web-programming", "development-tools"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = "1"
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }

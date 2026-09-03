@@ -438,31 +438,70 @@ impl RegistryService {
     {
         let key = Self::key(ctx, name);
         let current_owner = ctx.fiber().id();
-        let services = read(&self.services);
-        let records = services.get(&key)?;
-        records.iter().rev().find_map(|record| {
-            let owner = record.owner.upgrade()?;
-            if record.owner_id != current_owner && !owner.is_active() {
-                return None;
-            }
-            if record.check.as_ref().is_some_and(|check| check().is_err()) {
-                return None;
-            }
-            Arc::clone(&record.value).downcast::<T>().ok()
-        })
+        let candidates = {
+            let services = read(&self.services);
+            services.get(&key).map(|records| {
+                records
+                    .iter()
+                    .map(|record| {
+                        (
+                            record.owner_id,
+                            record.owner.upgrade(),
+                            Arc::clone(&record.value),
+                            record.check.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })?
+        };
+
+        candidates
+            .into_iter()
+            .rev()
+            .find_map(|(owner_id, owner, value, check)| {
+                let Some(owner) = owner else {
+                    return None;
+                };
+                if owner_id != current_owner && !owner.is_active() {
+                    return None;
+                }
+                if check.is_some_and(|check| check().is_err()) {
+                    return None;
+                }
+                Arc::clone(&value).downcast::<T>().ok()
+            })
     }
 
     pub fn has_service(&self, ctx: &CordisContext, name: &str) -> bool {
         let key = Self::key(ctx, name);
         let current_owner = ctx.fiber().id();
-        read(&self.services).get(&key).is_some_and(|records| {
-            records.iter().rev().any(|record| {
-                let Some(owner) = record.owner.upgrade() else {
-                    return false;
-                };
-                (record.owner_id == current_owner || owner.is_active())
-                    && record.check.as_ref().is_none_or(|check| check().is_ok())
+        let candidates = {
+            let services = read(&self.services);
+            services.get(&key).map(|records| {
+                records
+                    .iter()
+                    .map(|record| {
+                        (
+                            record.owner_id,
+                            record.owner.upgrade(),
+                            record.check.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             })
+        };
+
+        candidates.is_some_and(|records| {
+            records
+                .into_iter()
+                .rev()
+                .any(|(owner_id, owner, check)| {
+                    let Some(owner) = owner else {
+                        return false;
+                    };
+                    (owner_id == current_owner || owner.is_active())
+                        && check.is_none_or(|check| check().is_ok())
+                })
         })
     }
 

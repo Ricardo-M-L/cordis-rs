@@ -10,6 +10,5 @@ homepage = "https://github.com/Ricardo-M-L/cordis-rs"
 repository = "https://github.com/Ricardo-M-L/cordis-rs"
 
 [dependencies]
-cordis-core = { version = "0.1.0", path = "../cordis-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 futures = "0.3"
